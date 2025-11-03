@@ -1,13 +1,13 @@
-from flask import Flask, render_template, request  # type: ignore
-import cv2, os, tempfile, numpy as np, pywt, joblib  # type: ignore
-from scipy.stats import skew, kurtosis  # type: ignore
-from skimage.feature import local_binary_pattern, hog  # type: ignore
-from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
+from flask import Flask, render_template, request
+import cv2, os, tempfile, numpy as np, pywt, joblib
+from scipy.stats import skew, kurtosis
+from skimage.feature import local_binary_pattern, hog
+from sklearn.metrics.pairwise import cosine_similarity
+import base64
 
 app = Flask(__name__)
 
 ROI_SIZE = 1080
-DEBUG_SAVE = False
 GENUINE_REF_DIR = "resolution/genuine"
 
 # ---------------- MODEL LOAD ----------------
@@ -48,40 +48,54 @@ else:
 
 # ---------------- IMAGE PREPROCESS ----------------
 def detect_note_region(img):
+    """
+    Automatically crops the dense printed pattern region (like your close-up samples).
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (7, 7), 0), 60, 160)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    grad_x = cv2.Sobel(gray_blur, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray_blur, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = cv2.convertScaleAbs(cv2.addWeighted(
+        cv2.absdiff(grad_x, grad_y), 0.5, grad_y, 0.5, 0))
+
+    _, mask = cv2.threshold(grad_mag, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return img
+        h, w = img.shape[:2]
+        return img[h//6: 5*h//6, w//6: 5*w//6]
+
     contour = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(contour)
-    if w * h < 0.2 * img.shape[0] * img.shape[1]:
-        return img
-    return img[y:y+h, x:x+w]
+    pad = int(0.05 * max(w, h))
+    x, y = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
+    cropped = img[y:y2, x:x2]
+
+    if cropped.shape[0] < 100 or cropped.shape[1] < 100:
+        h, w = img.shape[:2]
+        cropped = img[h//6: 5*h//6, w//6: 5*w//6]
+
+    return cropped
 
 
 def preprocess_image(path, size=(ROI_SIZE, ROI_SIZE)):
-    """Read image, crop, resize, and normalize to grayscale identical to training pipeline."""
+    """Read, crop, grayscale normalize."""
     img = cv2.imread(path)
     if img is None:
         raise ValueError("Unreadable image.")
-    img = detect_note_region(img)
-    img = cv2.resize(img, size)
 
-    # ✅ Convert to grayscale directly here for consistency
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    note_roi = detect_note_region(img)
+    note_roi = cv2.resize(note_roi, size)
 
-    # CLAHE for lighting normalization
+    gray = cv2.cvtColor(note_roi, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
-
-    # Extra normalization for mobile captures
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    if DEBUG_SAVE:
-        cv2.imwrite("debug_input.png", gray)
-
-    return img, gray
+    return note_roi, gray
 
 
 # ---------------- FEATURE EXTRACTION ----------------
@@ -98,23 +112,18 @@ def wavelet_color_features(img, wavelet_name='db2'):
 
 def extract_features(img_color, gray):
     feats = wavelet_color_features(img_color)
-
-    # --- Texture via LBP ---
     lbp = local_binary_pattern(gray, P=8, R=1, method="uniform")
     hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 59), density=True)
     feats.extend(hist.tolist())
 
-    # --- Same 9 metrics as in train.py ---
     lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     blur = cv2.GaussianBlur(gray, (9, 9), 0)
     contrast_std = np.std(cv2.absdiff(gray, blur))
     bright_ratio = np.sum(gray > 220) / gray.size
-
     bright_mask = cv2.inRange(gray, 230, 255)
     contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     reflection_clusters = len([c for c in contours if 5 < cv2.contourArea(c) < 200])
     reflection_density = reflection_clusters / (gray.shape[0] * gray.shape[1] / 10000)
-
     color_std = np.std(cv2.cvtColor(img_color, cv2.COLOR_BGR2LAB)[:, :, 0])
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -134,7 +143,7 @@ def extract_features(img_color, gray):
     return np.array(feats, dtype=np.float32)
 
 
-# ---------------- PREDICT ----------------
+# ---------------- ROUTES ----------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -156,7 +165,6 @@ def predict():
         proba = rf.predict_proba(feats_scaled)[0]
         genuine_prob = float(proba[1])
 
-        # Pattern + Reflectivity checks
         reflectivity = np.sum(gray > 230) / gray.size
         test_hog = hog(cv2.resize(gray, (256, 256)), orientations=9,
                        pixels_per_cell=(16, 16), cells_per_block=(2, 2),
@@ -165,7 +173,6 @@ def predict():
             cosine_similarity([REF_HOG], [test_hog])[0][0] if REF_HOG is not None else 0.0
         )
 
-        # Decision thresholds
         if genuine_prob >= 0.9 and pattern_similarity > 0.85 and reflectivity > 0.001:
             result = "✅ Genuine Note"
         elif genuine_prob >= 0.8 and pattern_similarity > 0.75 and reflectivity > 0.0008:
@@ -174,9 +181,17 @@ def predict():
             result = "❌ Fake / Xerox Detected"
 
         confidence = f"{genuine_prob:.2f} | Pattern: {pattern_similarity:.2f} | Reflectivity: {reflectivity:.5f}"
+
+        # Convert processed grayscale image to base64 for display (no saving)
+        _, buffer = cv2.imencode('.jpg', gray)
+        gray_b64 = base64.b64encode(buffer).decode('utf-8')
+
         os.remove(temp_path)
 
-        return render_template("result.html", result=result, confidence=confidence)
+        return render_template("result.html",
+                               result=result,
+                               confidence=confidence,
+                               processed_image=gray_b64)
 
     except Exception as e:
         print("Error:", e)

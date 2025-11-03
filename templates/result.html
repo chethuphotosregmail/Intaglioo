@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div class="container">
+    <h1>🔍 Classification Result</h1>
+    <h2>{{ result }}</h2>
+    {% if confidence %}
+    <p>Confidence: {{ confidence }}</p>
+    {% endif %}
+    <a href="/">← Try Again</a>
+  </div>
+
+  <script>
+    let scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(75,1,0.1,1000);
+    let renderer=new THREE.WebGLRenderer({canvas:document.getElementById("canvas"),alpha:true});
+    renderer.setClearColor(0x0f0408,1);
+    let geo=new THREE.SphereGeometry(5,24,24),mat=new THREE.MeshBasicMaterial({color:0x0f0408});
+    let sphere=new THREE.Mesh(geo,mat);scene.add(sphere);
+    let edges=new THREE.EdgesGeometry(geo),wire=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color:0xffff55}));
+    sphere.add(wire);camera.position.z=8.5;
+    function resize(){const a=window.innerWidth/window.innerHeight;camera.aspect=a;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);}
+    window.addEventListener('resize',resize);resize();
+    (function animate(){requestAnimationFrame(animate);sphere.rotation.y+=0.01;sphere.rotation.x+=0.005;renderer.render(scene,camera)})();
+  </script>
+</body>
+</html>

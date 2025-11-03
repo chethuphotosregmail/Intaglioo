@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Wavelet Note Classifier</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div class="container">
+    <h1>💵 Wavelet Note Authenticity Classifier</h1>
+
+    <form id="noteForm" action="/predict" method="post" enctype="multipart/form-data">
+      <p>Choose an option:</p>
+
+      <!-- camera -->
+      <label for="cameraInput" class="camera-btn">📸 Capture Using Camera</label>
+      <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
+
+      <!-- upload -->
+      <label for="uploadInput" class="upload-btn">📂 Upload From Gallery</label>
+      <input type="file" id="uploadInput" accept="image/*" hidden>
+
+      <!-- hidden actual file that Flask will receive -->
+      <input type="file" id="mainFile" name="file" hidden>
+
+      <button type="submit">Classify Note</button>
+    </form>
+
+    <p id="previewLabel"></p>
+    <img id="preview" src="" alt="" style="max-width: 200px; display: none; margin-top: 15px;">
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    // connect visible inputs to hidden mainFile
+    const mainFile = document.getElementById("mainFile");
+    const cameraInput = document.getElementById("cameraInput");
+    const uploadInput = document.getElementById("uploadInput");
+    const preview = document.getElementById("preview");
+    const previewLabel = document.getElementById("previewLabel");
+
+    function handleFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) {
+        const blobUrl = URL.createObjectURL(file);
+        preview.src = blobUrl;
+        preview.style.display = "block";
+        previewLabel.textContent = "✅ Image ready for classification";
+        mainFile.files = e.target.files; // copy selected file into main hidden input
+      }
+    }
+    cameraInput.addEventListener("change", handleFileSelect);
+    uploadInput.addEventListener("change", handleFileSelect);
+
+    // Background animation
+    let scene = new THREE.Scene();
+    let camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+    let renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("canvas"), alpha: true });
+    renderer.setClearColor(0x0f0408, 1);
+    let geo = new THREE.SphereGeometry(5, 24, 24);
+    let mat = new THREE.MeshBasicMaterial({ color: 0x0f0408 });
+    let sphere = new THREE.Mesh(geo, mat);
+    scene.add(sphere);
+    let edges = new THREE.EdgesGeometry(geo);
+    let wire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffff55 }));
+    sphere.add(wire);
+    camera.position.z = 8.5;
+    function resizeRenderer() {
+      const aspect = window.innerWidth / window.innerHeight;
+      camera.aspect = aspect;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener('resize', resizeRenderer);
+    resizeRenderer();
+    function animate() {
+      requestAnimationFrame(animate);
+      sphere.rotation.y += 0.01;
+      sphere.rotation.x += 0.005;
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>

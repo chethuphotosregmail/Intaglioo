@@ -4,3 +4,5 @@ opencv-python
 PyWavelets
 scipy
 scikit-learn
+scikit-image
+

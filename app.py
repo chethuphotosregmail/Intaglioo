@@ -1,25 +1,30 @@
 from flask import Flask, render_template, request
-import cv2, os, tempfile, numpy as np, pywt, joblib
-from scipy.stats import skew, kurtosis
-from skimage.feature import local_binary_pattern, hog
+import cv2, os, tempfile, numpy as np, base64
+from skimage.feature import hog
 from sklearn.metrics.pairwise import cosine_similarity
-import base64
+import tensorflow as tf
 
 app = Flask(__name__)
 
-ROI_SIZE = 1080
 GENUINE_REF_DIR = "resolution/genuine"
+MODEL_PATH = "oneplus_crop.tflite"
 
 # ---------------- MODEL LOAD ----------------
-if not os.path.exists("model_v5.pkl") or not os.path.exists("scaler_v5.pkl"):
-    raise FileNotFoundError("⚠️ model_v5.pkl or scaler_v5.pkl not found!")
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError("⚠️ TFLite model not found!")
 
-rf = joblib.load("model_v5.pkl")
-scaler = joblib.load("scaler_v5.pkl")
-print("✅ Model_v5 & Scaler_v5 loaded successfully!")
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+input_shape = input_details[0]['shape']
+EXPECTED_H, EXPECTED_W = input_shape[1], input_shape[2]
+EXPECTED_C = input_shape[3]
+print(f"✅ Model loaded. Expected input shape: {input_shape}")
 
 
-# ---------------- REFERENCE PATTERN ----------------
+# ---------------- REFERENCE HOG ----------------
 def compute_reference_hog():
     hogs = []
     for fname in os.listdir(GENUINE_REF_DIR):
@@ -43,104 +48,93 @@ REF_HOG = compute_reference_hog()
 if REF_HOG is None:
     print("⚠️ Warning: No genuine reference images found.")
 else:
-    print("✅ Reference pattern signature ready.")
+    print("✅ Reference HOG pattern ready.")
 
 
-# ---------------- IMAGE PREPROCESS ----------------
-def detect_note_region(img):
-    """
-    Automatically crops the dense printed pattern region (like your close-up samples).
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+# ---------------- DETECTION & CROPPING ----------------
+def detect_and_crop(img):
+    """Detect ROI using TFLite model output only when needed."""
+    h, w, _ = img.shape
+    aspect_ratio = w / h
 
-    grad_x = cv2.Sobel(gray_blur, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray_blur, cv2.CV_64F, 0, 1, ksize=3)
-    grad_mag = cv2.convertScaleAbs(cv2.addWeighted(
-        cv2.absdiff(grad_x, grad_y), 0.5, grad_y, 0.5, 0))
+    # 🔍 If the image is already a cropped region (square-ish), skip detection
+    if 0.8 <= aspect_ratio <= 1.2 and min(h, w) < 600:
+        print("🟡 Already cropped image detected — skipping model detection.")
+        return img
 
-    _, mask = cv2.threshold(grad_mag, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), iterations=2)
+    print("🔍 Running model-based detection...")
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (EXPECTED_W, EXPECTED_H))
+    input_data = np.expand_dims(resized.astype(np.float32) / 255.0, axis=0)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        h, w = img.shape[:2]
-        return img[h//6: 5*h//6, w//6: 5*w//6]
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details[0]['index'])[0]  # shape: (10647, 7)
 
-    contour = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(contour)
-    pad = int(0.05 * max(w, h))
-    x, y = max(0, x - pad), max(0, y - pad)
-    x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
-    cropped = img[y:y2, x:x2]
+    scores = np.maximum(output[:, 5], output[:, 6])
+    boxes = output[:, :4]
 
-    if cropped.shape[0] < 100 or cropped.shape[1] < 100:
-        h, w = img.shape[:2]
-        cropped = img[h//6: 5*h//6, w//6: 5*w//6]
+    conf_mask = scores > 0.4
+    boxes, scores = boxes[conf_mask], scores[conf_mask]
+
+    if len(boxes) == 0:
+        print("⚠️ No confident detections found — using original image.")
+        return img
+
+    boxes_px, areas = [], []
+    for b in boxes:
+        ymin, xmin, ymax, xmax = b
+        x1, y1, x2, y2 = (
+            int(xmin * w),
+            int(ymin * h),
+            int(xmax * w),
+            int(ymax * h)
+        )
+        if (x2 - x1) > 0 and (y2 - y1) > 0:
+            boxes_px.append([x1, y1, x2, y2])
+            areas.append((x2 - x1) * (y2 - y1))
+
+    if len(boxes_px) == 0:
+        print("⚠️ All detections invalid — using original image.")
+        return img
+
+    best_idx = int(np.argmax(areas))
+    x1, y1, x2, y2 = boxes_px[best_idx]
+    conf = float(scores[best_idx])
+    cropped = img[y1:y2, x1:x2]
+
+    if cropped.size == 0:
+        print("⚠️ Cropped image empty — using full image.")
+        return img
+
+    print(f"✅ Cropped region: ({x1},{y1}) → ({x2},{y2}) | Conf: {conf:.2f}")
+
+    debug_img = img.copy()
+    cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+    cv2.imwrite("detected_box_debug.png", debug_img)
 
     return cropped
 
 
-def preprocess_image(path, size=(ROI_SIZE, ROI_SIZE)):
-    """Read, crop, grayscale normalize."""
+
+# ---------------- PREPROCESS ----------------
+def preprocess_image(path):
+    """Crop using detection, resize, convert to grayscale safely."""
     img = cv2.imread(path)
     if img is None:
-        raise ValueError("Unreadable image.")
+        raise ValueError("Unreadable image file.")
 
-    note_roi = detect_note_region(img)
-    note_roi = cv2.resize(note_roi, size)
+    cropped = detect_and_crop(img)
+    if cropped is None or cropped.size == 0:
+        print("⚠️ Cropping failed — fallback to full image.")
+        cropped = img
 
-    gray = cv2.cvtColor(note_roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    return note_roi, gray
-
-
-# ---------------- FEATURE EXTRACTION ----------------
-def wavelet_color_features(img, wavelet_name='db2'):
-    feats = []
-    for channel in cv2.split(img):
-        coeffs2 = pywt.dwt2(channel, wavelet_name)
-        _, (cH, cV, cD) = coeffs2
-        for mat in [cH, cV, cD]:
-            hist, _ = np.histogram(mat.flatten(), bins=64, density=True)
-            feats.extend([np.var(hist), skew(hist), kurtosis(hist)])
-    return feats
-
-
-def extract_features(img_color, gray):
-    feats = wavelet_color_features(img_color)
-    lbp = local_binary_pattern(gray, P=8, R=1, method="uniform")
-    hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 59), density=True)
-    feats.extend(hist.tolist())
-
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    blur = cv2.GaussianBlur(gray, (9, 9), 0)
-    contrast_std = np.std(cv2.absdiff(gray, blur))
-    bright_ratio = np.sum(gray > 220) / gray.size
-    bright_mask = cv2.inRange(gray, 230, 255)
-    contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    reflection_clusters = len([c for c in contours if 5 < cv2.contourArea(c) < 200])
-    reflection_density = reflection_clusters / (gray.shape[0] * gray.shape[1] / 10000)
-    color_std = np.std(cv2.cvtColor(img_color, cv2.COLOR_BGR2LAB)[:, :, 0])
-    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    edge_mag = np.sqrt(sobelx**2 + sobely**2)
-    edge_uniformity = 1 / (np.std(edge_mag) + 1e-5)
-    edges = cv2.Canny(gray, 80, 160)
-    micro_edge_density = np.sum(edges > 0) / edges.size
-    specular_ratio = np.sum(gray > 245) / gray.size
-    highpass = gray - cv2.GaussianBlur(gray, (5, 5), 0)
-    texture_coarseness = np.std(highpass)
-
-    feats.extend([
-        lap_var, contrast_std, bright_ratio, reflection_density,
-        color_std, edge_uniformity, micro_edge_density,
-        specular_ratio, texture_coarseness
-    ])
-    return np.array(feats, dtype=np.float32)
+    return cropped, gray
 
 
 # ---------------- ROUTES ----------------
@@ -159,42 +153,40 @@ def predict():
         temp_path = os.path.join(tempfile.gettempdir(), file.filename)
         file.save(temp_path)
 
-        img_color, gray = preprocess_image(temp_path)
-        feats = extract_features(img_color, gray).reshape(1, -1)
-        feats_scaled = scaler.transform(feats)
-        proba = rf.predict_proba(feats_scaled)[0]
-        genuine_prob = float(proba[1])
+        cropped_color, gray = preprocess_image(temp_path)
 
         reflectivity = np.sum(gray > 230) / gray.size
         test_hog = hog(cv2.resize(gray, (256, 256)), orientations=9,
                        pixels_per_cell=(16, 16), cells_per_block=(2, 2),
                        visualize=False, block_norm='L2-Hys')
         pattern_similarity = (
-            cosine_similarity([REF_HOG], [test_hog])[0][0] if REF_HOG is not None else 0.0
+            cosine_similarity([REF_HOG], [test_hog])[0][0]
+            if REF_HOG is not None else 0.0
         )
 
-        if genuine_prob >= 0.9 and pattern_similarity > 0.85 and reflectivity > 0.001:
+        if pattern_similarity > 0.85 and reflectivity > 0.001:
             result = "✅ Genuine Note"
-        elif genuine_prob >= 0.8 and pattern_similarity > 0.75 and reflectivity > 0.0008:
+        elif pattern_similarity > 0.75:
             result = "⚠️ Likely Genuine (Low Light)"
         else:
             result = "❌ Fake / Xerox Detected"
 
-        confidence = f"{genuine_prob:.2f} | Pattern: {pattern_similarity:.2f} | Reflectivity: {reflectivity:.5f}"
+        confidence = f"Pattern: {pattern_similarity:.2f} | Reflectivity: {reflectivity:.5f}"
 
-        # Convert processed grayscale image to base64 for display (no saving)
-        _, buffer = cv2.imencode('.jpg', gray)
-        gray_b64 = base64.b64encode(buffer).decode('utf-8')
+        _, buffer = cv2.imencode('.png', gray)
+        processed_image = base64.b64encode(buffer).decode('utf-8')
 
         os.remove(temp_path)
 
-        return render_template("result.html",
-                               result=result,
-                               confidence=confidence,
-                               processed_image=gray_b64)
+        return render_template(
+            "result.html",
+            result=result,
+            confidence=confidence,
+            processed_image=processed_image
+        )
 
     except Exception as e:
-        print("Error:", e)
+        print("❌ Error:", e)
         return render_template("result.html", result=f"❌ Error: {str(e)}")
 
 

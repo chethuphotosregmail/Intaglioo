@@ -5,4 +5,5 @@ PyWavelets
 scipy
 scikit-learn
 scikit-image
+tensorflow
 
